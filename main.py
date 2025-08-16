@@ -150,6 +150,16 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
             )
             profiel = cur.fetchall()
 
+        # -------- NIEUW: demand per 15 minuten opslaan --------
+        cur.execute("DELETE FROM planning.demand_15m WHERE datum=%s AND rol=%s", (d, rol))
+        for start_ts, aandeel_p50 in profiel:
+            heads = round(max(0.0, float(aandeel_p50 or 0) * float(target_uren_dag) * 4), 2)  # uren→15m
+            cur.execute(
+                "INSERT INTO planning.demand_15m(datum, start_ts, rol, heads_needed) VALUES (%s, %s, %s, %s)",
+                (d, start_ts, rol, heads),
+            )
+        # -------- EINDE NIEUW --------
+
         cur.execute("DELETE FROM planning.voorstel_shifts WHERE datum=%s AND bron='auto'", (d,))
         total_blocks = 0
         for start_ts, aandeel_p50 in profiel:
