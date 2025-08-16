@@ -1,28 +1,29 @@
 import os
+import math
+import datetime as dt
 from datetime import timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo
-import math
 
 import psycopg
 from fastapi import FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel
 
+# ---------- Config ----------
 API_TOKEN = os.getenv("API_REKEN_TOKEN", "")
 DB_URL = os.getenv("DATABASE_URL", "")
 
-# Tijdzone en planner-parameters
-TZ = ZoneInfo("Europe/Amsterdam")
-STAFF_START_HHMM = "11:30"          # eerste kwartier waarin personeel mag staan
-STAFF_END_LAST_SLOT_HHMM = "22:45"  # laatste kwartier-start (einde 23:00)
-MIN_SHIFT_HOURS = 3                 # min. dienstduur
-MAX_STARTS_PER_SLOT = 1             # max nieuwe diensten per kwartier (staggered starts)
-LATE_BIAS = 0.25                    # zachte voorkeur om afrond-resten later op de dag te plaatsen (0..1)
+TZ = ZoneInfo("Europe/Amsterdam")     # vaste weergave/rekentijdzone
+STAFF_START_HHMM = "11:30"            # eerste kwartier waarin personeel mag starten
+STAFF_END_LAST_SLOT_HHMM = "22:45"    # laatste kwartier-start (einde 23:00)
+MIN_SHIFT_HOURS = 3                   # minimale dienstduur
+MAX_STARTS_PER_SLOT = 1               # max. nieuwe diensten per kwartier
+LATE_BIAS = 0.25                      # zachte voorkeur om afrond-rest later te plaatsen (0..1)
 
 app = FastAPI()
 
 
-# ---------- helpers ----------
+# ---------- Helpers ----------
 def _auth(authorization: Optional[str]):
     if not API_TOKEN:
         return
@@ -39,17 +40,17 @@ def _conn():
 
 
 def _in_staff_window(ts) -> bool:
-    """ts is timestamptz uit Postgres; check locale HH:MM in venster."""
+    """ts = tz-aware datetime uit Postgres; check lokale HH:MM binnen personeelsvenster."""
     tloc = ts.astimezone(TZ)
     hhmm = tloc.strftime("%H:%M")
     return (hhmm >= STAFF_START_HHMM) and (hhmm <= STAFF_END_LAST_SLOT_HHMM)
 
 
-def _iso(dt):
-    return dt.astimezone(TZ).isoformat()
+def _iso(dtobj):
+    return dtobj.astimezone(TZ).isoformat()
 
 
-# ---------- models ----------
+# ---------- Models ----------
 class ForecastPayload(BaseModel):
     date: str  # "YYYY-MM-DD"
 
@@ -60,10 +61,10 @@ class OptimizePayload(BaseModel):
     rol: str = "balie"
 
 
-# ---------- misc ----------
+# ---------- Meta/health ----------
 @app.get("/__version__")
 def ver():
-    return {"v": "auto-optimizer-no-template-nl"}
+    return {"v": "auto-optimizer-no-template-nl-tzfix"}
 
 
 @app.get("/healthz")
@@ -71,13 +72,13 @@ def healthz():
     return {"ok": True}
 
 
-# ---------- forecast ----------
+# ---------- Forecast ----------
 @app.post("/forecast/day")
 def forecast(payload: ForecastPayload, authorization: Optional[str] = Header(None)):
     _auth(authorization)
     d = payload.date
     with _conn() as conn, conn.cursor() as cur:
-        # dag-p50/p80 vanuit historie (weekday/dow)
+        # dag-P50/P80 op basis van DOW
         cur.execute("""
             WITH dag_hist AS (
               SELECT date(start_ts) AS dag, SUM(omzet) AS dag_omzet
@@ -98,7 +99,7 @@ def forecast(payload: ForecastPayload, authorization: Optional[str] = Header(Non
             ON CONFLICT (datum) DO NOTHING;
         """, (d, d, d))
 
-        # profiel (96 kwartieren) in NL-tijd opslaan; fallback uniform
+        # 15m-profiel (NL-tijd); fallback uniform
         cur.execute("""
             WITH hist AS (
               SELECT (start_ts::time) AS tod,
@@ -134,7 +135,7 @@ def forecast(payload: ForecastPayload, authorization: Optional[str] = Header(Non
     return {"ok": True, "date": d}
 
 
-# ---------- optimize (NO TEMPLATE) ----------
+# ---------- Optimize (geen templates) ----------
 @app.post("/optimize/day")
 def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(None)):
     _auth(authorization)
@@ -143,7 +144,7 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
     rol = payload.rol
 
     with _conn() as conn, conn.cursor() as cur:
-        # omzet P50 en blended rate
+        # omzet & blended rate
         cur.execute("SELECT omzet_p50 FROM prognose.dag WHERE datum=%s", (d,))
         row = cur.fetchone()
         if not row or not row[0]:
@@ -165,7 +166,7 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
 
         target_uren_dag = (doel_pct * omzet_p50) / blended_rate  # uren die we mogen plannen
 
-        # omzetprofiel ophalen (NL-tijd), 96 rijen garanderen
+        # profiel ophalen (NL-tijd), 96 rijen garanderen
         cur.execute("SELECT start_ts, aandeel_p50 FROM prognose.profiel_15m WHERE datum=%s ORDER BY start_ts", (d,))
         profiel = cur.fetchall()
         if not profiel:
@@ -194,10 +195,19 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
                 need_f.append(val)
                 w_sum += val
 
+        # als niets binnen venster: leeg resultaat
         if w_sum == 0:
-            # geen profiel binnen venster → niets plannen
             cur.execute("DELETE FROM planning.demand_15m WHERE datum=%s AND rol=%s", (d, rol))
             cur.execute("DELETE FROM planning.diensten_voorstel WHERE datum=%s AND rol=%s AND bron='auto'", (d, rol))
+            cur.execute("""
+                INSERT INTO planning.kpi_dag(datum, omzet_forecast_p50, geplande_kosten, geplande_pct, updated_at)
+                VALUES (%s, %s, 0, 0, now())
+                ON CONFLICT (datum) DO UPDATE SET
+                  omzet_forecast_p50=EXCLUDED.omzet_forecast_p50,
+                  geplande_kosten=0,
+                  geplande_pct=0,
+                  updated_at=now()
+            """, (d, omzet_p50))
             return {"ok": True, "date": d, "target_uren_dag": 0.0, "geplande_uren_dag": 0.0}
 
         # schaal naar kwartier-koppen (uren * 4)
@@ -208,12 +218,11 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
         base = [int(math.floor(x)) for x in need_f]
         remainder = int(round(sum(need_f))) - sum(base)
         if remainder > 0:
-            # gewicht = frac * (1 + LATE_BIAS * (i/N))
             N = max(1, len(need_f) - 1)
             scored = []
             for i, x in enumerate(need_f):
                 frac = x - base[i]
-                bias = 1.0 + LATE_BIAS * (i / N)
+                bias = 1.0 + LATE_BIAS * (i / N)  # later op de dag iets zwaarder
                 scored.append((i, frac * bias))
             scored.sort(key=lambda p: p[1], reverse=True)
             j = 0
@@ -222,10 +231,7 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
                 base[idx] += 1
                 j += 1
         elif remainder < 0:
-            scored = []
-            for i, x in enumerate(need_f):
-                frac = x - base[i]
-                scored.append((i, frac))  # kleinste eerst
+            scored = [(i, (x - base[i])) for i, x in enumerate(need_f)]
             scored.sort(key=lambda p: p[1])
             j = 0
             for _ in range(-remainder):
@@ -234,11 +240,11 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
                     base[idx] -= 1
                 j += 1
 
-        need = base[:]                    # integer koppen per kwartier
-        planned_blocks = sum(need)        # geplande kwartieren (kop-kwartieren)
+        need = base[:]                         # integer koppen per kwartier
+        planned_blocks = sum(need)             # kop-kwartieren
         geplande_uren_dag = planned_blocks / 4.0
 
-        # 3) demand wegschrijven (integer koppen)
+        # 3) demand wegschrijven
         cur.execute("DELETE FROM planning.demand_15m WHERE datum=%s AND rol=%s", (d, rol))
         for ts, k in zip(times, need):
             cur.execute(
@@ -246,19 +252,19 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
                 (d, ts, rol, int(k)),
             )
 
-        # 4) diensten bouwen met staged starts (max 1 nieuwe per slot) + min 3u
+        # 4) diensten bouwen met staggered starts + min. 3u + hard dag-einde 23:00 NL-tijd
         cur.execute(
             "DELETE FROM planning.diensten_voorstel WHERE datum=%s AND rol=%s AND bron='auto'",
             (d, rol)
         )
-        active = []  # start_times van open diensten
-        backlog_open = 0
+        active = []          # start_ts van open diensten
+        backlog_open = 0     # extra opens die we doorschuiven vanwege MAX_STARTS_PER_SLOT
 
         for ts, k in zip(times, need):
             required = k + backlog_open
             delta = required - len(active)
 
-            # openen: staggered
+            # openen (stagger)
             if delta > 0:
                 opens = min(delta, MAX_STARTS_PER_SLOT)
                 for _ in range(opens):
@@ -268,7 +274,6 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
                 backlog_open = 0
 
             # sluiten (min. 3 uur)
-            # Als we te veel open hebben en sommigen >= 3u draaien, sluit ze.
             to_close = len(active) - k
             if to_close > 0:
                 closed_now = 0
@@ -284,11 +289,12 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
                         closed_now += 1
                         continue
                     i += 1
-                # als niemand 3u heeft: tijdelijke overcapaciteit; we vangen dit aan het einde op
+                # als niemand 3u heeft: tijdelijk overbezet; eind-afhandeling fixt dit
 
-        # dag-einde: sluit alles netjes af, min. 3u afdwingen, niet later dan 23:00
+        # dag-einde: expliciet 23:00 lokale tijd (Europe/Amsterdam)
         if times:
-            day_end = times[-1] + timedelta(minutes=15)  # 23:00
+            d_date = dt.date.fromisoformat(d)
+            day_end = dt.datetime(d_date.year, d_date.month, d_date.day, 23, 0, tzinfo=TZ)
             for s in active:
                 end = max(s + timedelta(hours=MIN_SHIFT_HOURS), day_end)
                 if end > day_end:
@@ -298,19 +304,21 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
                     (d, rol, s, end)
                 )
 
-        # 5) compat: blok-output (kan zo blijven)
+        # 5) compat: blok-output met integer koppen
         cur.execute("DELETE FROM planning.voorstel_shifts WHERE datum=%s AND bron='auto'", (d,))
-        for ts, a in profiel:
+        need_map = {t: n for t, n in zip(times, need)}
+        for ts, _a in profiel:
             if not _in_staff_window(ts):
                 continue
+            n = need_map.get(ts, 0)
             cur.execute("""
                 INSERT INTO planning.voorstel_shifts
                   (datum, medewerker_id, rol, start_ts, eind_ts, bron, objective_note)
                 VALUES
                   (%s, NULL, %s, %s, %s, 'auto', %s)
-            """, (d, rol, ts, ts + timedelta(minutes=15), f"int_koppen={need[times.index(ts)]}"))
+            """, (d, rol, ts, ts + timedelta(minutes=15), f"int_koppen={n}"))
 
-        # 6) KPI op basis van geplande uren
+        # 6) KPI
         geplande_kosten = geplande_uren_dag * blended_rate
         geplande_pct = (geplande_kosten / omzet_p50) * 100 if omzet_p50 else None
 
@@ -335,7 +343,7 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
     }
 
 
-# ---------- READ: diensten (DAY) ----------
+# ---------- Read: diensten (day) ----------
 @app.get("/diensten/day")
 def diensten_day(
     date: str = Query(..., description="YYYY-MM-DD"),
@@ -344,19 +352,9 @@ def diensten_day(
 ):
     _auth(authorization)
     with _conn() as conn, conn.cursor() as cur:
+        # ruwe timestamptz ophalen (geen AT TIME ZONE in SQL)
         cur.execute("""
-            SELECT id,
-                   datum,
-                   rol,
-                   (start_ts AT TIME ZONE 'Europe/Amsterdam') AS start_local,
-                   (eind_ts  AT TIME ZONE 'Europe/Amsterdam') AS eind_local,
-                   bron,
-                   ROUND(
-                     EXTRACT(EPOCH FROM (
-                       (eind_ts AT TIME ZONE 'Europe/Amsterdam') -
-                       (start_ts AT TIME ZONE 'Europe/Amsterdam')
-                     ))/3600.0
-                   , 2) AS duur_uren
+            SELECT id, datum, rol, start_ts, eind_ts, bron
             FROM planning.diensten_voorstel
             WHERE datum=%s AND rol=%s
             ORDER BY start_ts
@@ -364,29 +362,29 @@ def diensten_day(
         rows = cur.fetchall()
 
         diensten = []
-        for _id, datum, _rol, start_local, eind_local, bron, duur in rows:
+        total_secs = 0.0
+        first = last = None
+
+        for _id, datum, _rol, s_ts, e_ts, bron in rows:
+            s_loc = s_ts.astimezone(TZ)
+            e_loc = e_ts.astimezone(TZ)
+            dur_h = (e_loc - s_loc).total_seconds() / 3600.0
+            total_secs += (e_loc - s_loc).total_seconds()
+            if first is None or s_loc < first:
+                first = s_loc
+            if last is None or e_loc > last:
+                last = e_loc
             diensten.append({
                 "id": int(_id),
                 "datum": str(datum),
                 "rol": _rol,
-                "start_ts": _iso(start_local),
-                "eind_ts":  _iso(eind_local),
-                "duur_uren": float(duur or 0),
-                "bron": bron
+                "start_ts": s_loc.isoformat(),
+                "eind_ts":  e_loc.isoformat(),
+                "start_hhmm": s_loc.strftime("%H:%M"),
+                "eind_hhmm":  e_loc.strftime("%H:%M"),
+                "duur_uren": round(dur_h, 2),
+                "bron": bron,
             })
-
-        cur.execute("""
-            SELECT
-              ROUND(SUM(EXTRACT(EPOCH FROM (
-                (eind_ts AT TIME ZONE 'Europe/Amsterdam') -
-                (start_ts AT TIME ZONE 'Europe/Amsterdam')
-              )))/3600.0, 2) AS uren,
-              MIN(start_ts AT TIME ZONE 'Europe/Amsterdam') AS first_start,
-              MAX(eind_ts  AT TIME ZONE 'Europe/Amsterdam') AS last_end
-            FROM planning.diensten_voorstel
-            WHERE datum=%s AND rol=%s
-        """, (date, rol))
-        tot, first_start, last_end = cur.fetchone()
 
         return {
             "ok": True,
@@ -394,8 +392,10 @@ def diensten_day(
             "date": date,
             "rol": rol,
             "dienst_count": len(diensten),
-            "totaal_uren": float(tot or 0),
-            "eerste_start": (_iso(first_start) if first_start else None),
-            "laatste_einde": (_iso(last_end) if last_end else None),
-            "diensten": diensten
+            "totaal_uren": round(total_secs / 3600.0, 2),
+            "eerste_start": first.isoformat() if first else None,
+            "laatste_einde": last.isoformat() if last else None,
+            "eerste_start_hhmm": first.strftime("%H:%M") if first else None,
+            "laatste_einde_hhmm": last.strftime("%H:%M") if last else None,
+            "diensten": diensten,
         }
