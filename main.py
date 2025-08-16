@@ -150,6 +150,30 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
             )
             profiel = cur.fetchall()
 
+            # --- NIEUW: self-healing; als het profiel <96 rijen heeft, vervang door uniform 96 blokken ---
+cur.execute("SELECT COUNT(*) FROM prognose.profiel_15m WHERE datum=%s", (d,))
+n_profiel = int(cur.fetchone()[0] or 0)
+if n_profiel < 96:
+    cur.execute("DELETE FROM prognose.profiel_15m WHERE datum=%s", (d,))
+    cur.execute("""
+        INSERT INTO prognose.profiel_15m(datum, start_ts, aandeel_p50, aandeel_p80)
+        SELECT %s::date, gs, 1.0/96, 1.0/96
+        FROM generate_series((%s::date)::timestamptz,
+                             (%s::date + time '23:45')::timestamptz,
+                             interval '15 minutes') AS gs
+    """, (d, d, d))
+    cur.execute(
+        "SELECT start_ts, aandeel_p50 FROM prognose.profiel_15m WHERE datum=%s ORDER BY start_ts",
+        (d,),
+    )
+    profiel = cur.fetchall()
+# --- EINDE NIEUW ---
+
+
+
+
+
+        
         # -------- demand per 15 minuten opslaan --------
         cur.execute("DELETE FROM planning.demand_15m WHERE datum=%s AND rol=%s", (d, rol))
         for start_ts, aandeel_p50 in profiel:
