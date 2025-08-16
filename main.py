@@ -10,10 +10,10 @@ API_TOKEN = os.getenv("API_REKEN_TOKEN", "")
 DB_URL = os.getenv("DATABASE_URL", "")
 
 # Personeelsvenster:
-# - open voor personeel om 11:30 (opstart 30m voor 12:00)
+# - personeel start 11:30 (opstart 30m voor opening 12:00)
 # - laatste 15m-blok start 22:45 en eindigt 23:00 (schoonmaak tot 23:00)
 STAFF_START_HHMM = "11:30"
-STAFF_END_LAST_SLOT_HHMM = "22:45"  # laatste slot zodat eindtijd 23:00 is
+STAFF_END_LAST_SLOT_HHMM = "22:45"  # laatste slot-start zodat eindtijd 23:00 is
 MIN_SHIFT_HOURS = 3
 
 app = FastAPI()
@@ -41,7 +41,7 @@ def _in_staff_window(ts) -> bool:
     hhmm = ts.strftime("%H:%M")
     return (hhmm >= STAFF_START_HHMM) and (hhmm <= STAFF_END_LAST_SLOT_HHMM)
 
-# ---------- models (BELANGRIJK voor Swagger) ----------
+# ---------- models ----------
 class ForecastPayload(BaseModel):
     date: str  # "YYYY-MM-DD"
 
@@ -184,10 +184,7 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
 
         # 3) Demand per 15 min opslaan (genormaliseerd binnen personeelsvenster)
         #    Som(heads_needed)/4 == target_uren_dag
-        def _w_sum():
-            return sum(float(a or 0) for (ts, a) in profiel if _in_staff_window(ts))
-
-        w_sum = _w_sum()
+        w_sum = sum(float(a or 0) for (ts, a) in profiel if _in_staff_window(ts))
         cur.execute("DELETE FROM planning.demand_15m WHERE datum=%s AND rol=%s", (d, rol))
         for ts, a in profiel:
             if _in_staff_window(ts) and w_sum > 0:
@@ -199,8 +196,7 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
                 (d, ts, rol, heads),
             )
 
-        # 4) Diensten vormen op basis van demand (som exact == target)
-        #    - integeriseer naar blokken (15m) met exacte totale som
+        # 4) Diensten vormen op basis van demand (som exact == target via round-robin)
         cur.execute("""
           SELECT start_ts, heads_needed
           FROM planning.demand_15m
@@ -213,20 +209,29 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
         times = [t for (t, h) in rows if _in_staff_window(t)]
         raw   = [float(h or 0) for (t, h) in rows if _in_staff_window(t)]
 
-        target_blocks = int(round(float(target_uren_dag) * 4))
-        base = [int(x) for x in raw]                   # floors
-        frac = [x - int(x) for x in raw]               # fracties
-        need = base[:]                                  # start met floors
+        target_blocks = int(round(sum(raw)))  # exact som uit demand
+        base = [int(x) for x in raw]          # floors per slot
+        frac = [x - b for x, b in zip(raw, base)]
+        need = base[:]
         rem  = target_blocks - sum(base)
 
-        if rem > 0:
-            idxs = sorted(range(len(frac)), key=lambda i: frac[i], reverse=True)
-            for i in idxs[:rem]:
-                need[i] += 1
-        elif rem < 0:
-            idxs = sorted(range(len(frac)), key=lambda i: frac[i])
-            for i in idxs[:(-rem)]:
-                need[i] = max(0, need[i] - 1)
+        if rem > 0 and len(frac) > 0:
+            order = sorted(range(len(frac)), key=lambda i: frac[i], reverse=True)
+            j = 0
+            while rem > 0:
+                idx = order[j % len(order)]
+                need[idx] += 1
+                rem -= 1
+                j += 1
+        elif rem < 0 and len(frac) > 0:
+            order = sorted(range(len(frac)), key=lambda i: frac[i])  # kleinste fracties eerst
+            j = 0
+            while rem < 0:
+                idx = order[j % len(order)]
+                if need[idx] > 0:
+                    need[idx] -= 1
+                    rem += 1
+                j += 1
 
         # Greedy: open/sluit diensten, minimaal MIN_SHIFT_HOURS, einde nooit later dan 23:00
         cur.execute(
@@ -266,7 +271,7 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
                     (d, rol, s, end)
                 )
 
-        # 5) Bestaande 15m-blok output (voor compatibiliteit/UI)
+        # 5) 15m-blok output (voor compatibiliteit/UI)
         cur.execute("DELETE FROM planning.voorstel_shifts WHERE datum=%s AND bron='auto'", (d,))
         total_blocks = 0
         for start_ts, aandeel_p50 in profiel:
@@ -295,7 +300,6 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
               updated_at=now()
         """, (d, omzet_p50, geplande_kosten, geplande_pct))
 
-    # (optioneel) aantal diensten teruggeven kan later toegevoegd worden
     return {
         "ok": True,
         "date": d,
