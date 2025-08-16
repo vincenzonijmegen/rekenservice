@@ -6,8 +6,8 @@ API_TOKEN = os.getenv("API_REKEN_TOKEN", "")
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "rekenservice"}
-
+    return {"greeting": "Hello, World!", "message": "Welcome to FastAPI!"}
+    
 @app.get("/healthz")
 def healthz():
     return {"ok": True}
