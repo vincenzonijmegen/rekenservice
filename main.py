@@ -11,7 +11,12 @@ DB_URL = os.getenv("DATABASE_URL", "")
 
 app = FastAPI()
 
-# --- helpers ---
+# vingerafdruk om zeker te weten welke build draait
+@app.get("/__version__")
+def ver():
+    return {"v": "db-v1"}
+
+# ---------- helpers ----------
 def _auth(authorization: Optional[str]):
     if not API_TOKEN:
         return
@@ -25,7 +30,7 @@ def _conn():
         raise HTTPException(status_code=500, detail="DATABASE_URL not set")
     return psycopg.connect(DB_URL, autocommit=True)
 
-# --- models (BELANGRIJK voor Swagger schema) ---
+# ---------- models (BELANGRIJK voor Swagger) ----------
 class ForecastPayload(BaseModel):
     date: str  # "YYYY-MM-DD"
 
@@ -34,14 +39,10 @@ class OptimizePayload(BaseModel):
     doel_pct: float = 0.23
     rol: str = "balie"
 
-# --- endpoints ---
+# ---------- endpoints ----------
 @app.get("/healthz")
 def healthz():
     return {"ok": True}
-
-@app.get("/__version__")
-def ver():
-    return {"v": "db-v1"}  # simpele vingerafdruk
 
 @app.post("/forecast/day")
 def forecast(payload: ForecastPayload, authorization: Optional[str] = Header(None)):
