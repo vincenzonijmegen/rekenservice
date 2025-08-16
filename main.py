@@ -209,8 +209,9 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
         times = [t for (t, h) in rows if _in_staff_window(t)]
         raw   = [float(h or 0) for (t, h) in rows if _in_staff_window(t)]
 
-        target_blocks = int(round(sum(raw)))  # exact som uit demand
-        base = [int(x) for x in raw]          # floors per slot
+        # integeriseer blokken met exacte totale som
+        target_blocks = int(round(sum(raw)))  # ≈ target_uren_dag * 4
+        base = [int(x) for x in raw]          # floors
         frac = [x - b for x, b in zip(raw, base)]
         need = base[:]
         rem  = target_blocks - sum(base)
@@ -233,7 +234,16 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
                     rem += 1
                 j += 1
 
-        # Greedy: open/sluit diensten, minimaal MIN_SHIFT_HOURS, einde nooit later dan 23:00
+        # Bepaal laatste moment waarop nog behoefte > 0 is
+        last_idx = -1
+        for i in range(len(need) - 1, -1, -1):
+            if need[i] > 0:
+                last_idx = i
+                break
+        needed_end = (times[last_idx] + timedelta(minutes=15)) if last_idx >= 0 else (times[-1] + timedelta(minutes=15))
+        staff_end_ts = times[-1] + timedelta(minutes=15)  # 22:45 + 15m = 23:00
+
+        # Greedy: open/sluit diensten, minimaal MIN_SHIFT_HOURS
         cur.execute(
             "DELETE FROM planning.diensten_voorstel WHERE datum=%s AND rol=%s AND bron='auto'",
             (d, rol)
@@ -260,12 +270,15 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
                     # niemand lang genoeg: laat tijdelijk overcapaciteit staan
                     break
 
-        # sluit resterende diensten aan het einde; clamp op 23:00
+        # Sluit resterende open diensten:
+        # - minstens MIN_SHIFT_HOURS
+        # - tot het laatste moment waar nog behoefte was (needed_end)
+        # - nooit voorbij staff_end_ts (23:00)
         if times:
-            staff_end_ts = times[-1] + timedelta(minutes=15)  # 22:45 + 15m = 23:00
             for s in active:
-                desired_end = s + timedelta(hours=MIN_SHIFT_HOURS)
-                end = desired_end if desired_end <= staff_end_ts else staff_end_ts
+                end = max(s + timedelta(hours=MIN_SHIFT_HOURS), needed_end)
+                if end > staff_end_ts:
+                    end = staff_end_ts
                 cur.execute(
                     "INSERT INTO planning.diensten_voorstel(datum,rol,start_ts,eind_ts,bron) VALUES (%s,%s,%s,%s,'auto')",
                     (d, rol, s, end)
