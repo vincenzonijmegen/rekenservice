@@ -159,6 +159,68 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
                 (d, start_ts, rol, heads),
             )
         # -------- EINDE NIEUW --------
+# -------- NIEUW: maak diensten op basis van demand --------
+min_shift_h = 3                       # minimaal 3 uur per dienst
+open_t, close_t = "08:00", "22:00"    # openingstijden (pas zonodig aan)
+
+# lees demand binnen openingstijden en rond af naar koppen (integers)
+cur.execute("""
+  SELECT start_ts, CEIL(heads_needed)::int AS koppen
+  FROM planning.demand_15m
+  WHERE datum=%s AND rol=%s
+    AND (start_ts::time) >= %s::time
+    AND (start_ts::time) <= %s::time
+  ORDER BY start_ts
+""", (d, rol, open_t, close_t))
+slots = cur.fetchall()
+
+# eenvoudige smoothing: 3-blok gemiddelde om zaagtand te beperken
+def _smooth(ints):
+  out=[]; n=len(ints)
+  for i in range(n):
+    w = [ints[j] for j in (i-1,i,i+1) if 0 <= j < n]
+    out.append(int(round(sum(w)/len(w))))
+  return out
+
+times  = [t for t,_ in slots]
+need   = _smooth([k for _,k in slots]) if slots else []
+
+# greedy: open/sluit diensten om aan 'need' te voldoen
+cur.execute("DELETE FROM planning.diensten_voorstel WHERE datum=%s AND rol=%s AND bron='auto'", (d, rol))
+active = []  # lijst met start_ts van open diensten
+from datetime import timedelta
+
+for t, required in zip(times, need):
+    # open nieuwe diensten
+    while len(active) < required:
+        active.append(t)
+    # sluit extra diensten als ze min. 3 uur hebben gedraaid
+    while len(active) > required:
+        # kies de oudste die min. lengte heeft
+        closed = False
+        for i, s in enumerate(active):
+            if (t - s) >= timedelta(hours=min_shift_h):
+                start = active.pop(i)
+                cur.execute(
+                    "INSERT INTO planning.diensten_voorstel(datum,rol,start_ts,eind_ts,bron) VALUES (%s,%s,%s,%s,'auto')",
+                    (d, rol, start, t)
+                )
+                closed = True
+                break
+        if not closed:
+            # nog niemand lang genoeg: laat tijdelijk overcapaciteit staan
+            break
+
+# sluit alles aan het einde van de dag (min. 3 uur afdwingen)
+if times:
+    day_end = times[-1] + timedelta(minutes=15)
+    for s in active:
+        end = max(day_end, s + timedelta(hours=min_shift_h))
+        cur.execute(
+            "INSERT INTO planning.diensten_voorstel(datum,rol,start_ts,eind_ts,bron) VALUES (%s,%s,%s,%s,'auto')",
+            (d, rol, s, end)
+        )
+# -------- EINDE NIEUW --------
 
         cur.execute("DELETE FROM planning.voorstel_shifts WHERE datum=%s AND bron='auto'", (d,))
         total_blocks = 0
