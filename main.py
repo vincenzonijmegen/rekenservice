@@ -9,6 +9,13 @@ from pydantic import BaseModel
 API_TOKEN = os.getenv("API_REKEN_TOKEN", "")
 DB_URL = os.getenv("DATABASE_URL", "")
 
+# Personeelsvenster:
+# - open voor personeel om 11:30 (opstart 30m voor 12:00)
+# - laatste 15m-blok start 22:45 en eindigt 23:00 (schoonmaak tot 23:00)
+STAFF_START_HHMM = "11:30"
+STAFF_END_LAST_SLOT_HHMM = "22:45"  # laatste slot zodat eindtijd 23:00 is
+MIN_SHIFT_HOURS = 3
+
 app = FastAPI()
 
 # vingerafdruk om zeker te weten welke build draait
@@ -29,6 +36,10 @@ def _conn():
     if not DB_URL:
         raise HTTPException(status_code=500, detail="DATABASE_URL not set")
     return psycopg.connect(DB_URL, autocommit=True)
+
+def _in_staff_window(ts) -> bool:
+    hhmm = ts.strftime("%H:%M")
+    return (hhmm >= STAFF_START_HHMM) and (hhmm <= STAFF_END_LAST_SLOT_HHMM)
 
 # ---------- models (BELANGRIJK voor Swagger) ----------
 class ForecastPayload(BaseModel):
@@ -108,7 +119,7 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
     rol = payload.rol
 
     with _conn() as conn, conn.cursor() as cur:
-        # 1) Forecast en rate
+        # 1) Forecast en blended rate
         cur.execute("SELECT omzet_p50 FROM prognose.dag WHERE datum=%s", (d,))
         row = cur.fetchone()
         if not row or not row[0]:
@@ -171,50 +182,53 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
             profiel = cur.fetchall()
         # --- einde self-healing ---
 
-        # 3) Demand per 15 min opslaan
+        # 3) Demand per 15 min opslaan (genormaliseerd binnen personeelsvenster)
+        #    Som(heads_needed)/4 == target_uren_dag
+        def _w_sum():
+            return sum(float(a or 0) for (ts, a) in profiel if _in_staff_window(ts))
+
+        w_sum = _w_sum()
         cur.execute("DELETE FROM planning.demand_15m WHERE datum=%s AND rol=%s", (d, rol))
-        for start_ts, aandeel_p50 in profiel:
-            heads = round(max(0.0, float(aandeel_p50 or 0) * float(target_uren_dag) * 4), 2)  # uren→15m
+        for ts, a in profiel:
+            if _in_staff_window(ts) and w_sum > 0:
+                heads = round((float(a or 0) / w_sum) * float(target_uren_dag) * 4, 2)
+            else:
+                heads = 0.0
             cur.execute(
                 "INSERT INTO planning.demand_15m(datum, start_ts, rol, heads_needed) VALUES (%s, %s, %s, %s)",
-                (d, start_ts, rol, heads),
+                (d, ts, rol, heads),
             )
 
-        # 4) Diensten vormen op basis van demand
-        min_shift_h = 3                       # minimaal 3 uur per dienst
-        open_t, close_t = "08:00", "22:00"    # openingstijden
-
+        # 4) Diensten vormen op basis van demand (som exact == target)
+        #    - integeriseer naar blokken (15m) met exacte totale som
         cur.execute("""
-          SELECT start_ts, CEIL(heads_needed)::int AS koppen
+          SELECT start_ts, heads_needed
           FROM planning.demand_15m
           WHERE datum=%s AND rol=%s
-            AND (start_ts::time) >= %s::time
-            AND (start_ts::time) <= %s::time
           ORDER BY start_ts
-        """, (d, rol, open_t, close_t))
-        slots = cur.fetchall()
+        """, (d, rol))
+        rows = cur.fetchall()
 
-        # fallback: als filter niets oplevert, pak alle slots
-        if not slots:
-            cur.execute("""
-              SELECT start_ts, CEIL(heads_needed)::int AS koppen
-              FROM planning.demand_15m
-              WHERE datum=%s AND rol=%s
-              ORDER BY start_ts
-            """, (d, rol))
-            slots = cur.fetchall()
+        # filter op personeelsvenster
+        times = [t for (t, h) in rows if _in_staff_window(t)]
+        raw   = [float(h or 0) for (t, h) in rows if _in_staff_window(t)]
 
-        # smoothing: 3-blok gemiddelde om zaagtand te beperken
-        def _smooth(ints):
-            out=[]; n=len(ints)
-            for i in range(n):
-                w = [ints[j] for j in (i-1,i,i+1) if 0 <= j < n]
-                out.append(int(round(sum(w)/len(w))))
-            return out
+        target_blocks = int(round(float(target_uren_dag) * 4))
+        base = [int(x) for x in raw]                   # floors
+        frac = [x - int(x) for x in raw]               # fracties
+        need = base[:]                                  # start met floors
+        rem  = target_blocks - sum(base)
 
-        times  = [t for t,_ in slots]
-        need   = _smooth([k for _,k in slots]) if slots else []
+        if rem > 0:
+            idxs = sorted(range(len(frac)), key=lambda i: frac[i], reverse=True)
+            for i in idxs[:rem]:
+                need[i] += 1
+        elif rem < 0:
+            idxs = sorted(range(len(frac)), key=lambda i: frac[i])
+            for i in idxs[:(-rem)]:
+                need[i] = max(0, need[i] - 1)
 
+        # Greedy: open/sluit diensten, minimaal MIN_SHIFT_HOURS, einde nooit later dan 23:00
         cur.execute(
             "DELETE FROM planning.diensten_voorstel WHERE datum=%s AND rol=%s AND bron='auto'",
             (d, rol)
@@ -225,11 +239,11 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
             # open nieuwe diensten
             while len(active) < required:
                 active.append(t)
-            # sluit extra diensten (minimale lengte afgedwongen)
+            # sluit extra diensten (minimale lengte afgedwongen waar mogelijk)
             while len(active) > required:
                 closed = False
                 for i, s in enumerate(active):
-                    if (t - s) >= timedelta(hours=min_shift_h):
+                    if (t - s) >= timedelta(hours=MIN_SHIFT_HOURS):
                         start = active.pop(i)
                         cur.execute(
                             "INSERT INTO planning.diensten_voorstel(datum,rol,start_ts,eind_ts,bron) VALUES (%s,%s,%s,%s,'auto')",
@@ -241,11 +255,12 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
                     # niemand lang genoeg: laat tijdelijk overcapaciteit staan
                     break
 
-        # sluit resterende diensten aan het einde van de dag (min. 3 uur)
+        # sluit resterende diensten aan het einde; clamp op 23:00
         if times:
-            day_end = times[-1] + timedelta(minutes=15)
+            staff_end_ts = times[-1] + timedelta(minutes=15)  # 22:45 + 15m = 23:00
             for s in active:
-                end = max(day_end, s + timedelta(hours=min_shift_h))
+                desired_end = s + timedelta(hours=MIN_SHIFT_HOURS)
+                end = desired_end if desired_end <= staff_end_ts else staff_end_ts
                 cur.execute(
                     "INSERT INTO planning.diensten_voorstel(datum,rol,start_ts,eind_ts,bron) VALUES (%s,%s,%s,%s,'auto')",
                     (d, rol, s, end)
@@ -269,6 +284,7 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
         geplande_kosten = target_uren_dag * blended_rate
         geplande_pct = (geplande_kosten / omzet_p50) * 100 if omzet_p50 else None
 
+        # 6) KPI bijwerken
         cur.execute("""
             INSERT INTO planning.kpi_dag(datum, omzet_forecast_p50, geplande_kosten, geplande_pct, updated_at)
             VALUES (%s, %s, %s, %s, now())
@@ -279,6 +295,7 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
               updated_at=now()
         """, (d, omzet_p50, geplande_kosten, geplande_pct))
 
+    # (optioneel) aantal diensten teruggeven kan later toegevoegd worden
     return {
         "ok": True,
         "date": d,
