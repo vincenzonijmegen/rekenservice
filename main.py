@@ -11,7 +11,6 @@ DB_URL = os.getenv("DATABASE_URL", "")
 
 app = FastAPI()
 
-
 # ---------- helpers ----------
 def _auth(authorization: Optional[str]):
     if not API_TOKEN:
@@ -21,29 +20,24 @@ def _auth(authorization: Optional[str]):
     if authorization.split()[1] != API_TOKEN:
         raise HTTPException(status_code=403, detail="Forbidden")
 
-
 def _conn():
     if not DB_URL:
         raise HTTPException(status_code=500, detail="DATABASE_URL not set")
     return psycopg.connect(DB_URL, autocommit=True)
 
-
 # ---------- models ----------
 class ForecastPayload(BaseModel):
     date: str  # "YYYY-MM-DD"
-
 
 class OptimizePayload(BaseModel):
     date: str
     doel_pct: float = 0.23
     rol: str = "balie"
 
-
 # ---------- endpoints ----------
 @app.get("/healthz")
 def healthz():
     return {"ok": True}
-
 
 @app.post("/forecast/day")
 def forecast(payload: ForecastPayload, authorization: Optional[str] = Header(None)):
@@ -97,8 +91,7 @@ def forecast(payload: ForecastPayload, authorization: Optional[str] = Header(Non
 
         # Fallback: als er geen profiel is, vul uniform (1/96)
         cur.execute("SELECT COUNT(*) FROM prognose.profiel_15m WHERE datum=%s", (d,))
-        cnt = cur.fetchone()[0]
-        if cnt == 0:
+        if (cur.fetchone()[0] or 0) == 0:
             cur.execute(
                 """
                 INSERT INTO prognose.profiel_15m(datum, start_ts, aandeel_p50, aandeel_p80)
@@ -112,9 +105,7 @@ def forecast(payload: ForecastPayload, authorization: Optional[str] = Header(Non
                 """,
                 (d, d, d),
             )
-
     return {"ok": True, "date": d}
-
 
 @app.post("/optimize/day")
 def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(None)):
@@ -125,15 +116,10 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
 
     with _conn() as conn, conn.cursor() as cur:
         # Zorg dat er een forecast is
-        cur.execute("SELECT omzet_p50, omzet_p80 FROM prognose.dag WHERE datum=%s", (d,))
+        cur.execute("SELECT omzet_p50 FROM prognose.dag WHERE datum=%s", (d,))
         row = cur.fetchone()
-        if not row:
-            # probeer baseline te vullen en opnieuw lezen
-            _ = forecast(ForecastPayload(date=d), authorization=f"Bearer {API_TOKEN}" if API_TOKEN else None)
-            cur.execute("SELECT omzet_p50, omzet_p80 FROM prognose.dag WHERE datum=%s", (d,))
-            row = cur.fetchone()
         if not row or not row[0]:
-            raise HTTPException(status_code=400, detail="Forecast ontbreekt voor die datum")
+            raise HTTPException(status_code=400, detail="Forecast ontbreekt of is 0 voor die datum")
 
         omzet_p50 = float(row[0])
 
@@ -158,23 +144,15 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
 
         # Profiel ophalen (anders uniform)
         cur.execute(
-            """
-            SELECT start_ts, aandeel_p50
-            FROM prognose.profiel_15m
-            WHERE datum=%s
-            ORDER BY start_ts
-            """,
+            "SELECT start_ts, aandeel_p50 FROM prognose.profiel_15m WHERE datum=%s ORDER BY start_ts",
             (d,),
         )
         profiel = cur.fetchall()
         if not profiel:
-            # uniform vullen en opnieuw lezen
             cur.execute(
                 """
                 INSERT INTO prognose.profiel_15m(datum, start_ts, aandeel_p50, aandeel_p80)
-                SELECT dd::date,
-                       gs AS start_ts,
-                       1.0/96, 1.0/96
+                SELECT dd::date, gs, 1.0/96, 1.0/96
                 FROM (SELECT %s::date AS dd) x,
                      generate_series((%s::date)::timestamptz,
                                      (%s::date + time '23:45')::timestamptz,
@@ -189,7 +167,7 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
             )
             profiel = cur.fetchall()
 
-        # Schrijf "blokken" weg als simpele voorstellen (15m)
+        # Schrijf 15m blokken als simpele voorstellen
         cur.execute("DELETE FROM planning.voorstel_shifts WHERE datum=%s AND bron='auto'", (d,))
         total_blocks = 0
         for start_ts, aandeel_p50 in profiel:
