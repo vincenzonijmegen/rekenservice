@@ -3,7 +3,7 @@ from datetime import timedelta
 from typing import Optional, List, Tuple
 
 import psycopg
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel
 
 API_TOKEN = os.getenv("API_REKEN_TOKEN", "")
@@ -42,7 +42,6 @@ def _in_staff_window(ts) -> bool:
     return (hhmm >= STAFF_START_HHMM) and (hhmm <= STAFF_END_LAST_SLOT_HHMM)
 
 def _time_str(ts) -> str:
-    # 'HH:MM:SS' voor directe lexicografische vergelijking met SQL time::text
     return ts.strftime("%H:%M:%S")
 
 # ---------- models ----------
@@ -54,11 +53,12 @@ class OptimizePayload(BaseModel):
     doel_pct: float = 0.23
     rol: str = "balie"
 
-# ---------- endpoints ----------
+# ---------- health ----------
 @app.get("/healthz")
 def healthz():
     return {"ok": True, "build": "V1"}
 
+# ---------- forecast ----------
 @app.post("/forecast/day")
 def forecast(payload: ForecastPayload, authorization: Optional[str] = Header(None)):
     _auth(authorization)
@@ -115,6 +115,7 @@ def forecast(payload: ForecastPayload, authorization: Optional[str] = Header(Non
             """, (d, d, d))
     return {"ok": True, "date": d}
 
+# ---------- optimize ----------
 @app.post("/optimize/day")
 def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(None)):
     _auth(authorization)
@@ -190,7 +191,7 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
             )
             profiel = cur.fetchall()
 
-        # 3) Template-regels voor (maand, dow_group, rol)
+        # 3) Template-regels (maand, dow_group, rol)
         cur.execute("""
           SELECT start_t::text, end_t::text, heads, op
           FROM planning.template_bezetting
@@ -229,11 +230,12 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
         #    b) baseline uit template toepassen per slot
         baseline = [0 for _ in times]
         for i, t in enumerate(times):
-            tt = _time_str(t)  # 'HH:MM:SS'
+            tt = _time_str(t)
             b = 0
             for st, et, h, op in template_rules:
-                # end exclusief
-                if (tt >= (st if len(st)==8 else st+":00")) and (tt < (et if len(et)==8 else et+":00")):
+                st8 = st if len(st) == 8 else f"{st}:00"
+                et8 = et if len(et) == 8 else f"{et}:00"
+                if (tt >= st8) and (tt < et8):  # end exclusief
                     if op == 'base':
                         b = max(b, int(h))
                     elif op == 'add':
@@ -272,10 +274,9 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
             if need[i] < baseline[i]:
                 need[i] = baseline[i]
 
-        planned_blocks = sum(need)  # dit zijn de daadwerkelijke blokken die we plannen
+        planned_blocks = sum(need)
 
         #    e) diensten bouwen (greedy), min. 3 uur, sluiten op laatste behoefte of 23:00
-        #       bepaal laatste index met behoefte > 0
         last_idx = -1
         for i in range(len(need) - 1, -1, -1):
             if need[i] > 0:
@@ -288,13 +289,11 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
             "DELETE FROM planning.diensten_voorstel WHERE datum=%s AND rol=%s AND bron='auto'",
             (d, rol)
         )
-        active: List = []  # start_ts van open diensten
+        active: List = []
 
         for t, required in zip(times, need):
-            # open nieuwe diensten
             while len(active) < required:
                 active.append(t)
-            # sluit extra diensten (minimale lengte afgedwongen waar mogelijk)
             while len(active) > required:
                 closed = False
                 for i, s in enumerate(active):
@@ -307,10 +306,8 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
                         closed = True
                         break
                 if not closed:
-                    # niemand lang genoeg: laat tijdelijk overcapaciteit staan
                     break
 
-        # sluit resterende open diensten
         if times and staff_end_ts:
             for s in active:
                 end = max(s + timedelta(hours=MIN_SHIFT_HOURS), needed_end)
@@ -321,12 +318,12 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
                     (d, rol, s, end)
                 )
 
-        # 6) 15m-blok output (voor compatibiliteit/UI)
+        # 6) 15m blok-output (voor compatibiliteit/UI)
         cur.execute("DELETE FROM planning.voorstel_shifts WHERE datum=%s AND bron='auto'", (d,))
         total_blocks = 0
         for start_ts, aandeel_p50 in profiel:
             uren_blok = float(target_uren_dag) * float(aandeel_p50 or 0)
-            personen_equiv = round(max(0.0, uren_blok * 4), 2)  # 15m -> *4
+            personen_equiv = round(max(0.0, uren_blok * 4), 2)
             note = f"target_uren_blok={uren_blok:.3f}, personen_equiv={personen_equiv}"
             cur.execute("""
                 INSERT INTO planning.voorstel_shifts
@@ -336,7 +333,7 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
             """, (d, rol, start_ts, start_ts + timedelta(minutes=15), note))
             total_blocks += 1
 
-        # 7) KPI (let op: gebruik **daadwerkelijke** geplande uren i.p.v. target)
+        # 7) KPI op basis van geplande uren
         geplande_uren_dag = planned_blocks / 4.0
         geplande_kosten = geplande_uren_dag * blended_rate
         geplande_pct = (geplande_kosten / omzet_p50) * 100 if omzet_p50 else None
@@ -363,3 +360,51 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
         "geplande_pct": round(float(geplande_pct or 0), 2),
         "blocks_written": total_blocks,
     }
+
+# ---------- READ: diensten (DAY) ----------
+@app.get("/diensten/day")
+def diensten_day(
+    date: str = Query(..., description="YYYY-MM-DD"),
+    rol: str = Query("balie"),
+    authorization: Optional[str] = Header(None),
+):
+    _auth(authorization)
+    with _conn() as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT id, datum, rol, start_ts, eind_ts, bron,
+                   ROUND(EXTRACT(EPOCH FROM (eind_ts - start_ts))/3600.0, 2) AS duur_uren
+            FROM planning.diensten_voorstel
+            WHERE datum=%s AND rol=%s
+            ORDER BY start_ts
+        """, (date, rol))
+        rows = cur.fetchall()
+        diensten = []
+        for r in rows:
+            _id, datum, _rol, start_ts, eind_ts, bron, duur = r
+            diensten.append({
+                "id": int(_id),
+                "datum": str(datum),
+                "rol": _rol,
+                "start_ts": start_ts.isoformat(),
+                "eind_ts": eind_ts.isoformat(),
+                "duur_uren": float(duur or 0),
+                "bron": bron
+            })
+
+        cur.execute("""
+            SELECT ROUND(SUM(EXTRACT(EPOCH FROM (eind_ts - start_ts))/3600.0), 2),
+                   MIN(start_ts), MAX(eind_ts)
+            FROM planning.diensten_voorstel
+            WHERE datum=%s AND rol=%s
+        """, (date, rol))
+        tot, first_start, last_end = cur.fetchone()
+        return {
+            "ok": True,
+            "date": date,
+            "rol": rol,
+            "dienst_count": len(diensten),
+            "totaal_uren": float(tot or 0),
+            "eerste_start": (first_start.isoformat() if first_start else None),
+            "laatste_einde": (last_end.isoformat() if last_end else None),
+            "diensten": diensten
+        }
