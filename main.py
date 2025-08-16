@@ -11,6 +11,7 @@ DB_URL = os.getenv("DATABASE_URL", "")
 
 app = FastAPI()
 
+# ---- helpers ----
 def _auth(authorization: Optional[str]):
     if not API_TOKEN:
         return
@@ -24,14 +25,16 @@ def _conn():
         raise HTTPException(status_code=500, detail="DATABASE_URL not set")
     return psycopg.connect(DB_URL, autocommit=True)
 
+# ---- models ----
 class ForecastPayload(BaseModel):
-    date: str
+    date: str  # "YYYY-MM-DD"
 
 class OptimizePayload(BaseModel):
     date: str
     doel_pct: float = 0.23
     rol: str = "balie"
 
+# ---- endpoints ----
 @app.get("/healthz")
 def healthz():
     return {"ok": True}
@@ -41,7 +44,9 @@ def forecast(payload: ForecastPayload, authorization: Optional[str] = Header(Non
     _auth(authorization)
     d = payload.date
     with _conn() as conn, conn.cursor() as cur:
-        cur.execute("""
+        # Dagomzet-forecast (simpel: gemiddelde per DOW)
+        cur.execute(
+            """
             WITH dag_hist AS (
               SELECT date(start_ts) AS dag, SUM(omzet) AS dag_omzet
               FROM rapportage.omzet_15m
@@ -59,9 +64,13 @@ def forecast(payload: ForecastPayload, authorization: Optional[str] = Header(Non
                    COALESCE((SELECT avg_omzet*1.1 FROM by_dow
                              WHERE dow = CAST(EXTRACT(DOW FROM %s::date) AS int)), 0)
             ON CONFLICT (datum) DO NOTHING;
-        """, (d, d, d))
+            """,
+            (d, d, d),
+        )
 
-        cur.execute("""
+        # 15m-profiel (gemiddeld aandeel per tijdstip voor die DOW)
+        cur.execute(
+            """
             WITH hist AS (
               SELECT (start_ts::time) AS tod,
                      CAST(EXTRACT(DOW FROM dag) AS int) AS dow,
@@ -74,111 +83,4 @@ def forecast(payload: ForecastPayload, authorization: Optional[str] = Header(Non
                    (%s::date + tod)::timestamptz AS start_ts,
                    COALESCE(a50, 1.0/96), COALESCE(a50, 1.0/96)
             FROM hist
-            WHERE dow = CAST(EXTRACT(DOW FROM %s::date) AS int)
-            ON CONFLICT (datum, start_ts) DO NOTHING;
-        """, (d, d, d))
-
-        cur.execute("SELECT COUNT(*) FROM prognose.profiel_15m WHERE datum=%s", (d,))
-        if (cur.fetchone()[0] or 0) == 0:
-            cur.execute("""
-                INSERT INTO prognose.profiel_15m(datum, start_ts, aandeel_p50, aandeel_p80)
-                SELECT dd::date,
-                       gs AS start_ts,
-                       1.0/96, 1.0/96
-                FROM (SELECT %s::date AS dd) x,
-                     generate_series((%s::date)::timestamptz,
-                                     (%s::date + time '23:45')::timestamptz,
-                                     interval '15 minutes') AS gs
-            """, (d, d, d))
-    return {"ok": True, "date": d}
-
-@app.post("/optimize/day")
-def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(None)):
-    _auth(authorization)
-    d = payload.date
-    doel_pct = float(payload.doel_pct)
-    rol = payload.rol
-
-    with _conn() as conn, conn.cursor() as cur:
-        cur.execute("SELECT omzet_p50 FROM prognose.dag WHERE datum=%s", (d,))
-        row = cur.fetchone()
-        if not row or not row[0]:
-            raise HTTPException(status_code=400, detail="Forecast ontbreekt of is 0 voor die datum")
-        omzet_p50 = float(row[0])
-
-        cur.execute("""
-            WITH r AS (
-              SELECT DISTINCT ON (rol) rol, all_in_eur
-              FROM kosten.uurlonen
-              WHERE (geldig_tot IS NULL OR geldig_tot >= CURRENT_DATE)
-              ORDER BY rol, geldig_vanaf DESC
-            )
-            SELECT AVG(all_in_eur)::numeric FROM r;
-        """)
-        blended_rate = float(cur.fetchone()[0] or 0)
-        if blended_rate <= 0:
-            raise HTTPException(status_code=400, detail="Geen geldige uurlonen gevonden")
-
-        target_uren_dag = (doel_pct * omzet_p50) / blended_rate
-
-        cur.execute("""
-            SELECT start_ts, aandeel_p50
-            FROM prognose.profiel_15m
-            WHERE datum=%s
-            ORDER BY start_ts
-        """, (d,))
-        profiel = cur.fetchall()
-        if not profiel:
-            cur.execute("""
-                INSERT INTO prognose.profiel_15m(datum, start_ts, aandeel_p50, aandeel_p80)
-                SELECT dd::date, gs, 1.0/96, 1.0/96
-                FROM (SELECT %s::date AS dd) x,
-                     generate_series((%s::date)::timestamptz,
-                                     (%s::date + time '23:45')::timestamptz,
-                                     interval '15 minutes') AS gs
-                ON CONFLICT DO NOTHING
-            """, (d, d, d))
-            cur.execute("""
-                SELECT start_ts, aandeel_p50
-                FROM prognose.profiel_15m
-                WHERE datum=%s
-                ORDER BY start_ts
-            """, (d,))
-            profiel = cur.fetchall()
-
-        cur.execute("DELETE FROM planning.voorstel_shifts WHERE datum=%s AND bron='auto'", (d,))
-        total_blocks = 0
-        for start_ts, aandeel_p50 in profiel:
-            uren_blok = float(target_uren_dag) * float(aandeel_p50 or 0)
-            personen_equiv = round(max(0.0, uren_blok * 4), 2)  # 15m -> *4
-            note = f"target_uren_blok={uren_blok:.3f}, personen_equiv={personen_equiv}"
-            cur.execute("""
-                INSERT INTO planning.voorstel_shifts
-                  (datum, medewerker_id, rol, start_ts, eind_ts, bron, objective_note)
-                VALUES
-                  (%s, NULL, %s, %s, %s, 'auto', %s)
-            """, (d, rol, start_ts, start_ts + timedelta(minutes=15), note))
-            total_blocks += 1
-
-        geplande_kosten = target_uren_dag * blended_rate
-        geplande_pct = (geplande_kosten / omzet_p50) * 100 if omzet_p50 else None
-
-        cur.execute("""
-            INSERT INTO planning.kpi_dag(datum, omzet_forecast_p50, geplande_kosten, geplande_pct, updated_at)
-            VALUES (%s, %s, %s, %s, now())
-            ON CONFLICT (datum) DO UPDATE SET
-              omzet_forecast_p50=EXCLUDED.omzet_forecast_p50,
-              geplande_kosten=EXCLUDED.geplande_kosten,
-              geplande_pct=EXCLUDED.geplande_pct,
-              updated_at=now()
-        """, (d, omzet_p50, geplande_kosten, geplande_pct))
-
-    return {
-        "ok": True,
-        "date": d,
-        "target_uren_dag": round(float(target_uren_dag), 3),
-        "blended_rate": round(float(blended_rate), 2),
-        "geplande_kosten": round(float(geplande_kosten), 2),
-        "geplande_pct": round(float(geplande_pct or 0), 2),
-        "blocks_written": total_blocks,
-    }
+            WHERE dow = CAST(EXTR
