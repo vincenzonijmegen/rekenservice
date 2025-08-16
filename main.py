@@ -42,7 +42,7 @@ class OptimizePayload(BaseModel):
 # ---------- endpoints ----------
 @app.get("/healthz")
 def healthz():
-    return {"ok": True}
+    return {"ok": True, "build": "V1"}
 
 @app.post("/forecast/day")
 def forecast(payload: ForecastPayload, authorization: Optional[str] = Header(None)):
