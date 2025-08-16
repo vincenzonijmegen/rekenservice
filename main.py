@@ -1,6 +1,6 @@
 import os
 from datetime import timedelta
-from typing import Optional
+from typing import Optional, List, Tuple
 
 import psycopg
 from fastapi import FastAPI, Header, HTTPException
@@ -18,10 +18,10 @@ MIN_SHIFT_HOURS = 3
 
 app = FastAPI()
 
-# vingerafdruk om zeker te weten welke build draait
+# vingerafdruk
 @app.get("/__version__")
 def ver():
-    return {"v": "db-v1"}
+    return {"v": "db-v1-template-month"}
 
 # ---------- helpers ----------
 def _auth(authorization: Optional[str]):
@@ -40,6 +40,10 @@ def _conn():
 def _in_staff_window(ts) -> bool:
     hhmm = ts.strftime("%H:%M")
     return (hhmm >= STAFF_START_HHMM) and (hhmm <= STAFF_END_LAST_SLOT_HHMM)
+
+def _time_str(ts) -> str:
+    # 'HH:MM:SS' voor directe lexicografische vergelijking met SQL time::text
+    return ts.strftime("%H:%M:%S")
 
 # ---------- models ----------
 class ForecastPayload(BaseModel):
@@ -119,6 +123,11 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
     rol = payload.rol
 
     with _conn() as conn, conn.cursor() as cur:
+        # 0) DOW & maand
+        cur.execute("SELECT CAST(EXTRACT(DOW FROM %s::date) AS int), CAST(EXTRACT(MONTH FROM %s::date) AS int)", (d, d))
+        dow, maand = cur.fetchone()
+        dow_group = 'weekend' if int(dow) in (0,6) else 'weekday'
+
         # 1) Forecast en blended rate
         cur.execute("SELECT omzet_p50 FROM prognose.dag WHERE datum=%s", (d,))
         row = cur.fetchone()
@@ -163,7 +172,7 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
             )
             profiel = cur.fetchall()
 
-        # --- self-healing: als profiel <96 rijen is, vervang door uniform 96 ---
+        # self-healing: altijd 96 regels
         cur.execute("SELECT COUNT(*) FROM prognose.profiel_15m WHERE datum=%s", (d,))
         n_profiel = int(cur.fetchone()[0] or 0)
         if n_profiel < 96:
@@ -180,10 +189,17 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
                 (d,),
             )
             profiel = cur.fetchall()
-        # --- einde self-healing ---
 
-        # 3) Demand per 15 min opslaan (genormaliseerd binnen personeelsvenster)
-        #    Som(heads_needed)/4 == target_uren_dag
+        # 3) Template-regels voor (maand, dow_group, rol)
+        cur.execute("""
+          SELECT start_t::text, end_t::text, heads, op
+          FROM planning.template_bezetting
+          WHERE maand=%s AND rol=%s AND dow_group=%s
+          ORDER BY start_t
+        """, (int(maand), rol, dow_group))
+        template_rules: List[Tuple[str,str,int,str]] = cur.fetchall()
+
+        # 4) Demand per 15m (genormaliseerd binnen personeelsvenster)
         w_sum = sum(float(a or 0) for (ts, a) in profiel if _in_staff_window(ts))
         cur.execute("DELETE FROM planning.demand_15m WHERE datum=%s AND rol=%s", (d, rol))
         for ts, a in profiel:
@@ -196,7 +212,8 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
                 (d, ts, rol, heads),
             )
 
-        # 4) Diensten vormen op basis van demand (som exact == target via round-robin)
+        # 5) Diensten vormen
+        #    a) lees demand in venster
         cur.execute("""
           SELECT start_ts, heads_needed
           FROM planning.demand_15m
@@ -205,16 +222,32 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
         """, (d, rol))
         rows = cur.fetchall()
 
-        # filter op personeelsvenster
+        # filter venster
         times = [t for (t, h) in rows if _in_staff_window(t)]
         raw   = [float(h or 0) for (t, h) in rows if _in_staff_window(t)]
 
-        # integeriseer blokken met exacte totale som
-        target_blocks = int(round(sum(raw)))  # ≈ target_uren_dag * 4
-        base = [int(x) for x in raw]          # floors
-        frac = [x - b for x, b in zip(raw, base)]
-        need = base[:]
-        rem  = target_blocks - sum(base)
+        #    b) baseline uit template toepassen per slot
+        baseline = [0 for _ in times]
+        for i, t in enumerate(times):
+            tt = _time_str(t)  # 'HH:MM:SS'
+            b = 0
+            for st, et, h, op in template_rules:
+                # end exclusief
+                if (tt >= (st if len(st)==8 else st+":00")) and (tt < (et if len(et)==8 else et+":00")):
+                    if op == 'base':
+                        b = max(b, int(h))
+                    elif op == 'add':
+                        b = b + int(h)
+                    elif op == 'set':
+                        b = int(h)
+            baseline[i] = b
+
+        #    c) integeriseren op blokken (round-robin), doel = som(raw) blokken
+        target_blocks_dyn = int(round(sum(raw)))  # ≈ target_uren_dag * 4
+        base_blocks = [int(x) for x in raw]
+        frac = [x - b for x, b in zip(raw, base_blocks)]
+        need = base_blocks[:]
+        rem  = target_blocks_dyn - sum(base_blocks)
 
         if rem > 0 and len(frac) > 0:
             order = sorted(range(len(frac)), key=lambda i: frac[i], reverse=True)
@@ -234,21 +267,28 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
                     rem += 1
                 j += 1
 
-        # Bepaal laatste moment waarop nog behoefte > 0 is
+        #    d) afdwingen van template-baseline (kan som verhogen boven target)
+        for i in range(len(need)):
+            if need[i] < baseline[i]:
+                need[i] = baseline[i]
+
+        planned_blocks = sum(need)  # dit zijn de daadwerkelijke blokken die we plannen
+
+        #    e) diensten bouwen (greedy), min. 3 uur, sluiten op laatste behoefte of 23:00
+        #       bepaal laatste index met behoefte > 0
         last_idx = -1
         for i in range(len(need) - 1, -1, -1):
             if need[i] > 0:
                 last_idx = i
                 break
         needed_end = (times[last_idx] + timedelta(minutes=15)) if last_idx >= 0 else (times[-1] + timedelta(minutes=15))
-        staff_end_ts = times[-1] + timedelta(minutes=15)  # 22:45 + 15m = 23:00
+        staff_end_ts = times[-1] + timedelta(minutes=15) if times else None
 
-        # Greedy: open/sluit diensten, minimaal MIN_SHIFT_HOURS
         cur.execute(
             "DELETE FROM planning.diensten_voorstel WHERE datum=%s AND rol=%s AND bron='auto'",
             (d, rol)
         )
-        active = []  # start_ts van open diensten
+        active: List = []  # start_ts van open diensten
 
         for t, required in zip(times, need):
             # open nieuwe diensten
@@ -270,11 +310,8 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
                     # niemand lang genoeg: laat tijdelijk overcapaciteit staan
                     break
 
-        # Sluit resterende open diensten:
-        # - minstens MIN_SHIFT_HOURS
-        # - tot het laatste moment waar nog behoefte was (needed_end)
-        # - nooit voorbij staff_end_ts (23:00)
-        if times:
+        # sluit resterende open diensten
+        if times and staff_end_ts:
             for s in active:
                 end = max(s + timedelta(hours=MIN_SHIFT_HOURS), needed_end)
                 if end > staff_end_ts:
@@ -284,7 +321,7 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
                     (d, rol, s, end)
                 )
 
-        # 5) 15m-blok output (voor compatibiliteit/UI)
+        # 6) 15m-blok output (voor compatibiliteit/UI)
         cur.execute("DELETE FROM planning.voorstel_shifts WHERE datum=%s AND bron='auto'", (d,))
         total_blocks = 0
         for start_ts, aandeel_p50 in profiel:
@@ -299,10 +336,11 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
             """, (d, rol, start_ts, start_ts + timedelta(minutes=15), note))
             total_blocks += 1
 
-        geplande_kosten = target_uren_dag * blended_rate
+        # 7) KPI (let op: gebruik **daadwerkelijke** geplande uren i.p.v. target)
+        geplande_uren_dag = planned_blocks / 4.0
+        geplande_kosten = geplande_uren_dag * blended_rate
         geplande_pct = (geplande_kosten / omzet_p50) * 100 if omzet_p50 else None
 
-        # 6) KPI bijwerken
         cur.execute("""
             INSERT INTO planning.kpi_dag(datum, omzet_forecast_p50, geplande_kosten, geplande_pct, updated_at)
             VALUES (%s, %s, %s, %s, now())
@@ -316,7 +354,10 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
     return {
         "ok": True,
         "date": d,
-        "target_uren_dag": round(float(target_uren_dag), 3),
+        "dow_group": dow_group,
+        "maand": int(maand),
+        "target_uren_dag": round(float(target_uren_dag), 2),
+        "geplande_uren_dag": round(float(geplande_uren_dag), 2),
         "blended_rate": round(float(blended_rate), 2),
         "geplande_kosten": round(float(geplande_kosten), 2),
         "geplande_pct": round(float(geplande_pct or 0), 2),
