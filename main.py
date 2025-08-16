@@ -108,6 +108,7 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
     rol = payload.rol
 
     with _conn() as conn, conn.cursor() as cur:
+        # 1) Forecast en rate
         cur.execute("SELECT omzet_p50 FROM prognose.dag WHERE datum=%s", (d,))
         row = cur.fetchone()
         if not row or not row[0]:
@@ -129,6 +130,7 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
 
         target_uren_dag = (doel_pct * omzet_p50) / blended_rate
 
+        # 2) Profiel ophalen (en desnoods opvullen)
         cur.execute(
             "SELECT start_ts, aandeel_p50 FROM prognose.profiel_15m WHERE datum=%s ORDER BY start_ts",
             (d,),
@@ -150,31 +152,26 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
             )
             profiel = cur.fetchall()
 
-            # --- NIEUW: self-healing; als het profiel <96 rijen heeft, vervang door uniform 96 blokken ---
-cur.execute("SELECT COUNT(*) FROM prognose.profiel_15m WHERE datum=%s", (d,))
-n_profiel = int(cur.fetchone()[0] or 0)
-if n_profiel < 96:
-    cur.execute("DELETE FROM prognose.profiel_15m WHERE datum=%s", (d,))
-    cur.execute("""
-        INSERT INTO prognose.profiel_15m(datum, start_ts, aandeel_p50, aandeel_p80)
-        SELECT %s::date, gs, 1.0/96, 1.0/96
-        FROM generate_series((%s::date)::timestamptz,
-                             (%s::date + time '23:45')::timestamptz,
-                             interval '15 minutes') AS gs
-    """, (d, d, d))
-    cur.execute(
-        "SELECT start_ts, aandeel_p50 FROM prognose.profiel_15m WHERE datum=%s ORDER BY start_ts",
-        (d,),
-    )
-    profiel = cur.fetchall()
-# --- EINDE NIEUW ---
+        # --- self-healing: als profiel <96 rijen is, vervang door uniform 96 ---
+        cur.execute("SELECT COUNT(*) FROM prognose.profiel_15m WHERE datum=%s", (d,))
+        n_profiel = int(cur.fetchone()[0] or 0)
+        if n_profiel < 96:
+            cur.execute("DELETE FROM prognose.profiel_15m WHERE datum=%s", (d,))
+            cur.execute("""
+                INSERT INTO prognose.profiel_15m(datum, start_ts, aandeel_p50, aandeel_p80)
+                SELECT %s::date, gs, 1.0/96, 1.0/96
+                FROM generate_series((%s::date)::timestamptz,
+                                     (%s::date + time '23:45')::timestamptz,
+                                     interval '15 minutes') AS gs
+            """, (d, d, d))
+            cur.execute(
+                "SELECT start_ts, aandeel_p50 FROM prognose.profiel_15m WHERE datum=%s ORDER BY start_ts",
+                (d,),
+            )
+            profiel = cur.fetchall()
+        # --- einde self-healing ---
 
-
-
-
-
-        
-        # -------- demand per 15 minuten opslaan --------
+        # 3) Demand per 15 min opslaan
         cur.execute("DELETE FROM planning.demand_15m WHERE datum=%s AND rol=%s", (d, rol))
         for start_ts, aandeel_p50 in profiel:
             heads = round(max(0.0, float(aandeel_p50 or 0) * float(target_uren_dag) * 4), 2)  # uren→15m
@@ -183,11 +180,10 @@ if n_profiel < 96:
                 (d, start_ts, rol, heads),
             )
 
-        # -------- diensten vormen op basis van demand --------
+        # 4) Diensten vormen op basis van demand
         min_shift_h = 3                       # minimaal 3 uur per dienst
         open_t, close_t = "08:00", "22:00"    # openingstijden
 
-        # lees demand binnen openingstijden en rond af naar koppen (integers)
         cur.execute("""
           SELECT start_ts, CEIL(heads_needed)::int AS koppen
           FROM planning.demand_15m
@@ -197,6 +193,16 @@ if n_profiel < 96:
           ORDER BY start_ts
         """, (d, rol, open_t, close_t))
         slots = cur.fetchall()
+
+        # fallback: als filter niets oplevert, pak alle slots
+        if not slots:
+            cur.execute("""
+              SELECT start_ts, CEIL(heads_needed)::int AS koppen
+              FROM planning.demand_15m
+              WHERE datum=%s AND rol=%s
+              ORDER BY start_ts
+            """, (d, rol))
+            slots = cur.fetchall()
 
         # smoothing: 3-blok gemiddelde om zaagtand te beperken
         def _smooth(ints):
@@ -209,7 +215,6 @@ if n_profiel < 96:
         times  = [t for t,_ in slots]
         need   = _smooth([k for _,k in slots]) if slots else []
 
-        # greedy: open/sluit diensten om aan 'need' te voldoen
         cur.execute(
             "DELETE FROM planning.diensten_voorstel WHERE datum=%s AND rol=%s AND bron='auto'",
             (d, rol)
@@ -246,7 +251,7 @@ if n_profiel < 96:
                     (d, rol, s, end)
                 )
 
-        # -------- bestaande blok-output (voor compatibiliteit/UI) --------
+        # 5) Bestaande 15m-blok output (voor compatibiliteit/UI)
         cur.execute("DELETE FROM planning.voorstel_shifts WHERE datum=%s AND bron='auto'", (d,))
         total_blocks = 0
         for start_ts, aandeel_p50 in profiel:
