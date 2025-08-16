@@ -1,7 +1,8 @@
 import os
 from datetime import timedelta
-from typing import Optional, List, Tuple
+from typing import Optional
 from zoneinfo import ZoneInfo
+import math
 
 import psycopg
 from fastapi import FastAPI, Header, HTTPException, Query
@@ -10,18 +11,15 @@ from pydantic import BaseModel
 API_TOKEN = os.getenv("API_REKEN_TOKEN", "")
 DB_URL = os.getenv("DATABASE_URL", "")
 
-# Tijdzone & venster
+# Tijdzone en planner-parameters
 TZ = ZoneInfo("Europe/Amsterdam")
-STAFF_START_HHMM = "11:30"      # personeel start
-STAFF_END_LAST_SLOT_HHMM = "22:45"  # laatste 15m-slot start (eind 23:00)
-MIN_SHIFT_HOURS = 3
+STAFF_START_HHMM = "11:30"          # eerste kwartier waarin personeel mag staan
+STAFF_END_LAST_SLOT_HHMM = "22:45"  # laatste kwartier-start (einde 23:00)
+MIN_SHIFT_HOURS = 3                 # min. dienstduur
+MAX_STARTS_PER_SLOT = 1             # max nieuwe diensten per kwartier (staggered starts)
+LATE_BIAS = 0.25                    # zachte voorkeur om afrond-resten later op de dag te plaatsen (0..1)
 
 app = FastAPI()
-
-
-@app.get("/__version__")
-def ver():
-    return {"v": "db-v1-template-month-nl"}
 
 
 # ---------- helpers ----------
@@ -41,16 +39,14 @@ def _conn():
 
 
 def _in_staff_window(ts) -> bool:
-    """
-    ts = Python datetime (tz-aware). Check of lokale HH:MM binnen personeelsvenster valt.
-    """
+    """ts is timestamptz uit Postgres; check locale HH:MM in venster."""
     tloc = ts.astimezone(TZ)
     hhmm = tloc.strftime("%H:%M")
     return (hhmm >= STAFF_START_HHMM) and (hhmm <= STAFF_END_LAST_SLOT_HHMM)
 
 
-def _hhmm_local(ts) -> str:
-    return ts.astimezone(TZ).strftime("%H:%M:%S")
+def _iso(dt):
+    return dt.astimezone(TZ).isoformat()
 
 
 # ---------- models ----------
@@ -64,10 +60,15 @@ class OptimizePayload(BaseModel):
     rol: str = "balie"
 
 
-# ---------- health ----------
+# ---------- misc ----------
+@app.get("/__version__")
+def ver():
+    return {"v": "auto-optimizer-no-template-nl"}
+
+
 @app.get("/healthz")
 def healthz():
-    return {"ok": True, "build": "V1"}
+    return {"ok": True}
 
 
 # ---------- forecast ----------
@@ -76,7 +77,7 @@ def forecast(payload: ForecastPayload, authorization: Optional[str] = Header(Non
     _auth(authorization)
     d = payload.date
     with _conn() as conn, conn.cursor() as cur:
-        # Dagniveau P50/P80
+        # dag-p50/p80 vanuit historie (weekday/dow)
         cur.execute("""
             WITH dag_hist AS (
               SELECT date(start_ts) AS dag, SUM(omzet) AS dag_omzet
@@ -97,7 +98,7 @@ def forecast(payload: ForecastPayload, authorization: Optional[str] = Header(Non
             ON CONFLICT (datum) DO NOTHING;
         """, (d, d, d))
 
-        # Profiel 15m — in NL-tijd opslaan
+        # profiel (96 kwartieren) in NL-tijd opslaan; fallback uniform
         cur.execute("""
             WITH hist AS (
               SELECT (start_ts::time) AS tod,
@@ -115,7 +116,6 @@ def forecast(payload: ForecastPayload, authorization: Optional[str] = Header(Non
             ON CONFLICT (datum, start_ts) DO NOTHING;
         """, (d, d, d))
 
-        # Fallback: uniform profiel (96 rijen) in NL-tijd
         cur.execute("SELECT COUNT(*) FROM prognose.profiel_15m WHERE datum=%s", (d,))
         if (cur.fetchone()[0] or 0) == 0:
             cur.execute("""
@@ -130,10 +130,11 @@ def forecast(payload: ForecastPayload, authorization: Optional[str] = Header(Non
                         interval '15 minutes'
                      ) AS gs
             """, (d, d, d))
+
     return {"ok": True, "date": d}
 
 
-# ---------- optimize ----------
+# ---------- optimize (NO TEMPLATE) ----------
 @app.post("/optimize/day")
 def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(None)):
     _auth(authorization)
@@ -142,13 +143,7 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
     rol = payload.rol
 
     with _conn() as conn, conn.cursor() as cur:
-        # DOW & maand
-        cur.execute("SELECT CAST(EXTRACT(DOW FROM %s::date) AS int), CAST(EXTRACT(MONTH FROM %s::date) AS int)",
-                    (d, d))
-        dow, maand = cur.fetchone()
-        dow_group = 'weekend' if int(dow) in (0, 6) else 'weekday'
-
-        # Forecast en blended rate
+        # omzet P50 en blended rate
         cur.execute("SELECT omzet_p50 FROM prognose.dag WHERE datum=%s", (d,))
         row = cur.fetchone()
         if not row or not row[0]:
@@ -168,13 +163,12 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
         if blended_rate <= 0:
             raise HTTPException(status_code=400, detail="Geen geldige uurlonen gevonden")
 
-        target_uren_dag = (doel_pct * omzet_p50) / blended_rate
+        target_uren_dag = (doel_pct * omzet_p50) / blended_rate  # uren die we mogen plannen
 
-        # Profiel ophalen (NL-tijd opgeslagen)
+        # omzetprofiel ophalen (NL-tijd), 96 rijen garanderen
         cur.execute("SELECT start_ts, aandeel_p50 FROM prognose.profiel_15m WHERE datum=%s ORDER BY start_ts", (d,))
         profiel = cur.fetchall()
         if not profiel:
-            # uniform profiel bij ontbreken
             cur.execute("""
                 INSERT INTO prognose.profiel_15m(datum, start_ts, aandeel_p50, aandeel_p80)
                 SELECT dd::date, gs, 1.0/96, 1.0/96
@@ -189,167 +183,134 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
             cur.execute("SELECT start_ts, aandeel_p50 FROM prognose.profiel_15m WHERE datum=%s ORDER BY start_ts", (d,))
             profiel = cur.fetchall()
 
-        # Self-healing: garandeer 96 rijen
-        cur.execute("SELECT COUNT(*) FROM prognose.profiel_15m WHERE datum=%s", (d,))
-        n_prof = int(cur.fetchone()[0] or 0)
-        if n_prof < 96:
-            cur.execute("DELETE FROM prognose.profiel_15m WHERE datum=%s", (d,))
-            cur.execute("""
-                INSERT INTO prognose.profiel_15m(datum, start_ts, aandeel_p50, aandeel_p80)
-                SELECT %s::date, gs, 1.0/96, 1.0/96
-                FROM generate_series(
-                        (%s::date) AT TIME ZONE 'Europe/Amsterdam',
-                        (%s::date + time '23:45') AT TIME ZONE 'Europe/Amsterdam',
-                        interval '15 minutes'
-                ) AS gs
-            """, (d, d, d))
-            cur.execute("SELECT start_ts, aandeel_p50 FROM prognose.profiel_15m WHERE datum=%s ORDER BY start_ts", (d,))
-            profiel = cur.fetchall()
-
-        # Template-regels
-        cur.execute("""
-          SELECT start_t::text, end_t::text, heads, op
-          FROM planning.template_bezetting
-          WHERE maand=%s AND rol=%s AND dow_group=%s
-          ORDER BY start_t
-        """, (int(maand), rol, dow_group))
-        template_rules: List[Tuple[str, str, int, str]] = cur.fetchall()
-
-        # Demand 15m normaliseren binnen personeelsvenster
-        w_sum = sum(float(a or 0) for (ts, a) in profiel if _in_staff_window(ts))
-        cur.execute("DELETE FROM planning.demand_15m WHERE datum=%s AND rol=%s", (d, rol))
+        # 1) fract. behoefte per kwartier binnen personeelsvenster
+        times = []
+        need_f = []
+        w_sum = 0.0
         for ts, a in profiel:
-            if _in_staff_window(ts) and w_sum > 0:
-                heads = round((float(a or 0) / w_sum) * float(target_uren_dag) * 4, 2)  # uren->blokken
-            else:
-                heads = 0.0
+            if _in_staff_window(ts):
+                times.append(ts)
+                val = max(0.0, float(a or 0))
+                need_f.append(val)
+                w_sum += val
+
+        if w_sum == 0:
+            # geen profiel binnen venster → niets plannen
+            cur.execute("DELETE FROM planning.demand_15m WHERE datum=%s AND rol=%s", (d, rol))
+            cur.execute("DELETE FROM planning.diensten_voorstel WHERE datum=%s AND rol=%s AND bron='auto'", (d, rol))
+            return {"ok": True, "date": d, "target_uren_dag": 0.0, "geplande_uren_dag": 0.0}
+
+        # schaal naar kwartier-koppen (uren * 4)
+        scale = (target_uren_dag * 4.0) / w_sum
+        need_f = [x * scale for x in need_f]  # fractional koppen per slot
+
+        # 2) integeriseren met zachte late-bias
+        base = [int(math.floor(x)) for x in need_f]
+        remainder = int(round(sum(need_f))) - sum(base)
+        if remainder > 0:
+            # gewicht = frac * (1 + LATE_BIAS * (i/N))
+            N = max(1, len(need_f) - 1)
+            scored = []
+            for i, x in enumerate(need_f):
+                frac = x - base[i]
+                bias = 1.0 + LATE_BIAS * (i / N)
+                scored.append((i, frac * bias))
+            scored.sort(key=lambda p: p[1], reverse=True)
+            j = 0
+            for _ in range(remainder):
+                idx = scored[j % len(scored)][0]
+                base[idx] += 1
+                j += 1
+        elif remainder < 0:
+            scored = []
+            for i, x in enumerate(need_f):
+                frac = x - base[i]
+                scored.append((i, frac))  # kleinste eerst
+            scored.sort(key=lambda p: p[1])
+            j = 0
+            for _ in range(-remainder):
+                idx = scored[j % len(scored)][0]
+                if base[idx] > 0:
+                    base[idx] -= 1
+                j += 1
+
+        need = base[:]                    # integer koppen per kwartier
+        planned_blocks = sum(need)        # geplande kwartieren (kop-kwartieren)
+        geplande_uren_dag = planned_blocks / 4.0
+
+        # 3) demand wegschrijven (integer koppen)
+        cur.execute("DELETE FROM planning.demand_15m WHERE datum=%s AND rol=%s", (d, rol))
+        for ts, k in zip(times, need):
             cur.execute(
                 "INSERT INTO planning.demand_15m(datum, start_ts, rol, heads_needed) VALUES (%s, %s, %s, %s)",
-                (d, ts, rol, heads),
+                (d, ts, rol, int(k)),
             )
 
-        # Lees demand voor dienstenbouw
-        cur.execute("""
-          SELECT start_ts, heads_needed
-          FROM planning.demand_15m
-          WHERE datum=%s AND rol=%s
-          ORDER BY start_ts
-        """, (d, rol))
-        rows = cur.fetchall()
-
-        times = [t for (t, h) in rows if _in_staff_window(t)]
-        raw = [float(h or 0) for (t, h) in rows if _in_staff_window(t)]
-
-        # Baseline uit template toepassen
-        baseline = [0 for _ in times]
-        for i, t in enumerate(times):
-            tt = _hhmm_local(t)  # 'HH:MM:SS' in NL-tijd
-            b = 0
-            for st, et, h, op in template_rules:
-                st8 = st if len(st) == 8 else f"{st}:00"
-                et8 = et if len(et) == 8 else f"{et}:00"
-                if (tt >= st8) and (tt < et8):  # end exclusief
-                    if op == 'base':
-                        b = max(b, int(h))
-                    elif op == 'add':
-                        b = b + int(h)
-                    elif op == 'set':
-                        b = int(h)
-            baseline[i] = b
-
-        # Integeriseren naar blokken (round-robin)
-        target_blocks_dyn = int(round(sum(raw)))
-        base_blocks = [int(x) for x in raw]
-        frac = [x - b for x, b in zip(raw, base_blocks)]
-        need = base_blocks[:]
-        rem = target_blocks_dyn - sum(base_blocks)
-
-        if rem > 0 and len(frac) > 0:
-            order = sorted(range(len(frac)), key=lambda i: frac[i], reverse=True)
-            j = 0
-            while rem > 0:
-                idx = order[j % len(order)]
-                need[idx] += 1
-                rem -= 1
-                j += 1
-        elif rem < 0 and len(frac) > 0:
-            order = sorted(range(len(frac)), key=lambda i: frac[i])
-            j = 0
-            while rem < 0:
-                idx = order[j % len(order)]
-                if need[idx] > 0:
-                    need[idx] -= 1
-                    rem += 1
-                j += 1
-
-        # Template-baseline afdwingen
-        for i in range(len(need)):
-            if need[i] < baseline[i]:
-                need[i] = baseline[i]
-
-        planned_blocks = sum(need)
-
-        # Diensten bouwen (greedy)
-        # vind laatste index met behoefte
-        last_idx = -1
-        for i in range(len(need) - 1, -1, -1):
-            if need[i] > 0:
-                last_idx = i
-                break
-        needed_end = (times[last_idx] + timedelta(minutes=15)) if last_idx >= 0 else \
-                     (times[-1] + timedelta(minutes=15) if times else None)
-        staff_end_ts = times[-1] + timedelta(minutes=15) if times else None
-
+        # 4) diensten bouwen met staged starts (max 1 nieuwe per slot) + min 3u
         cur.execute(
             "DELETE FROM planning.diensten_voorstel WHERE datum=%s AND rol=%s AND bron='auto'",
             (d, rol)
         )
-        active: List = []
+        active = []  # start_times van open diensten
+        backlog_open = 0
 
-        for t, required in zip(times, need):
-            while len(active) < required:
-                active.append(t)
-            while len(active) > required:
-                closed = False
-                for i, s in enumerate(active):
-                    if (t - s) >= timedelta(hours=MIN_SHIFT_HOURS):
-                        start = active.pop(i)
+        for ts, k in zip(times, need):
+            required = k + backlog_open
+            delta = required - len(active)
+
+            # openen: staggered
+            if delta > 0:
+                opens = min(delta, MAX_STARTS_PER_SLOT)
+                for _ in range(opens):
+                    active.append(ts)
+                backlog_open = delta - opens
+            else:
+                backlog_open = 0
+
+            # sluiten (min. 3 uur)
+            # Als we te veel open hebben en sommigen >= 3u draaien, sluit ze.
+            to_close = len(active) - k
+            if to_close > 0:
+                closed_now = 0
+                i = 0
+                while i < len(active) and closed_now < to_close:
+                    s = active[i]
+                    if (ts - s) >= timedelta(hours=MIN_SHIFT_HOURS):
                         cur.execute(
                             "INSERT INTO planning.diensten_voorstel(datum,rol,start_ts,eind_ts,bron) VALUES (%s,%s,%s,%s,'auto')",
-                            (d, rol, start, t)
+                            (d, rol, s, ts)
                         )
-                        closed = True
-                        break
-                if not closed:
-                    break
+                        active.pop(i)
+                        closed_now += 1
+                        continue
+                    i += 1
+                # als niemand 3u heeft: tijdelijke overcapaciteit; we vangen dit aan het einde op
 
-        if times and staff_end_ts:
+        # dag-einde: sluit alles netjes af, min. 3u afdwingen, niet later dan 23:00
+        if times:
+            day_end = times[-1] + timedelta(minutes=15)  # 23:00
             for s in active:
-                end = max(s + timedelta(hours=MIN_SHIFT_HOURS), needed_end or staff_end_ts)
-                if end > staff_end_ts:
-                    end = staff_end_ts
+                end = max(s + timedelta(hours=MIN_SHIFT_HOURS), day_end)
+                if end > day_end:
+                    end = day_end
                 cur.execute(
                     "INSERT INTO planning.diensten_voorstel(datum,rol,start_ts,eind_ts,bron) VALUES (%s,%s,%s,%s,'auto')",
                     (d, rol, s, end)
                 )
 
-        # Blok-output (compatibiliteit/UI)
+        # 5) compat: blok-output (kan zo blijven)
         cur.execute("DELETE FROM planning.voorstel_shifts WHERE datum=%s AND bron='auto'", (d,))
-        total_blocks = 0
-        for start_ts, aandeel_p50 in profiel:
-            uren_blok = float(target_uren_dag) * float(aandeel_p50 or 0)
-            personen_equiv = round(max(0.0, uren_blok * 4), 2)
-            note = f"target_uren_blok={uren_blok:.3f}, personen_equiv={personen_equiv}"
+        for ts, a in profiel:
+            if not _in_staff_window(ts):
+                continue
             cur.execute("""
                 INSERT INTO planning.voorstel_shifts
                   (datum, medewerker_id, rol, start_ts, eind_ts, bron, objective_note)
                 VALUES
                   (%s, NULL, %s, %s, %s, 'auto', %s)
-            """, (d, rol, start_ts, start_ts + timedelta(minutes=15), note))
-            total_blocks += 1
+            """, (d, rol, ts, ts + timedelta(minutes=15), f"int_koppen={need[times.index(ts)]}"))
 
-        # KPI op basis van geplande uren
-        geplande_uren_dag = planned_blocks / 4.0
+        # 6) KPI op basis van geplande uren
         geplande_kosten = geplande_uren_dag * blended_rate
         geplande_pct = (geplande_kosten / omzet_p50) * 100 if omzet_p50 else None
 
@@ -366,14 +327,11 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
     return {
         "ok": True,
         "date": d,
-        "dow_group": dow_group,
-        "maand": int(maand),
         "target_uren_dag": round(float(target_uren_dag), 2),
         "geplande_uren_dag": round(float(geplande_uren_dag), 2),
         "blended_rate": round(float(blended_rate), 2),
         "geplande_kosten": round(float(geplande_kosten), 2),
         "geplande_pct": round(float(geplande_pct or 0), 2),
-        "blocks_written": total_blocks,
     }
 
 
@@ -386,7 +344,6 @@ def diensten_day(
 ):
     _auth(authorization)
     with _conn() as conn, conn.cursor() as cur:
-        # Diensten teruggeven in Europe/Amsterdam
         cur.execute("""
             SELECT id,
                    datum,
@@ -412,8 +369,8 @@ def diensten_day(
                 "id": int(_id),
                 "datum": str(datum),
                 "rol": _rol,
-                "start_ts": start_local.isoformat(),
-                "eind_ts":  eind_local.isoformat(),
+                "start_ts": _iso(start_local),
+                "eind_ts":  _iso(eind_local),
                 "duur_uren": float(duur or 0),
                 "bron": bron
             })
@@ -438,7 +395,7 @@ def diensten_day(
             "rol": rol,
             "dienst_count": len(diensten),
             "totaal_uren": float(tot or 0),
-            "eerste_start": (first_start.isoformat() if first_start else None),
-            "laatste_einde": (last_end.isoformat() if last_end else None),
+            "eerste_start": (_iso(first_start) if first_start else None),
+            "laatste_einde": (_iso(last_end) if last_end else None),
             "diensten": diensten
         }
