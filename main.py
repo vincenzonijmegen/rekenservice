@@ -11,7 +11,7 @@ DB_URL = os.getenv("DATABASE_URL", "")
 
 app = FastAPI()
 
-# ---- helpers ----
+# ---------- helpers ----------
 def _auth(authorization: Optional[str]):
     if not API_TOKEN:
         return
@@ -25,7 +25,7 @@ def _conn():
         raise HTTPException(status_code=500, detail="DATABASE_URL not set")
     return psycopg.connect(DB_URL, autocommit=True)
 
-# ---- models ----
+# ---------- models ----------
 class ForecastPayload(BaseModel):
     date: str  # "YYYY-MM-DD"
 
@@ -34,7 +34,7 @@ class OptimizePayload(BaseModel):
     doel_pct: float = 0.23
     rol: str = "balie"
 
-# ---- endpoints ----
+# ---------- endpoints ----------
 @app.get("/healthz")
 def healthz():
     return {"ok": True}
@@ -44,7 +44,7 @@ def forecast(payload: ForecastPayload, authorization: Optional[str] = Header(Non
     _auth(authorization)
     d = payload.date
     with _conn() as conn, conn.cursor() as cur:
-        # Dagomzet-forecast (simpel: gemiddelde per DOW)
+        # Dagomzet-forecast (simpel: gemiddelde per DOW uit historie)
         cur.execute(
             """
             WITH dag_hist AS (
@@ -68,7 +68,7 @@ def forecast(payload: ForecastPayload, authorization: Optional[str] = Header(Non
             (d, d, d),
         )
 
-        # 15m-profiel (gemiddeld aandeel per tijdstip voor die DOW)
+        # 15-min profiel (gemiddeld aandeel per tijdstip voor die DOW)
         cur.execute(
             """
             WITH hist AS (
@@ -89,7 +89,7 @@ def forecast(payload: ForecastPayload, authorization: Optional[str] = Header(Non
             (d, d, d),
         )
 
-        # Fallback: uniform profiel als er niets stond
+        # Fallback: als er geen profiel is, vul uniform (1/96)
         cur.execute("SELECT COUNT(*) FROM prognose.profiel_15m WHERE datum=%s", (d,))
         if (cur.fetchone()[0] or 0) == 0:
             cur.execute(
@@ -115,14 +115,14 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
     rol = payload.rol
 
     with _conn() as conn, conn.cursor() as cur:
-        # Forecast ophalen
+        # Zorg dat er een forecast is
         cur.execute("SELECT omzet_p50 FROM prognose.dag WHERE datum=%s", (d,))
         row = cur.fetchone()
         if not row or not row[0]:
             raise HTTPException(status_code=400, detail="Forecast ontbreekt of is 0 voor die datum")
         omzet_p50 = float(row[0])
 
-        # Blended all-in rate
+        # Gemiddelde all-in uurlonen (laatste per rol)
         cur.execute(
             """
             WITH r AS (
@@ -140,7 +140,7 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
 
         target_uren_dag = (doel_pct * omzet_p50) / blended_rate
 
-        # Profiel ophalen (of uniform maken)
+        # Profiel ophalen (anders uniform)
         cur.execute(
             "SELECT start_ts, aandeel_p50 FROM prognose.profiel_15m WHERE datum=%s ORDER BY start_ts",
             (d,),
@@ -165,7 +165,7 @@ def optimize(payload: OptimizePayload, authorization: Optional[str] = Header(Non
             )
             profiel = cur.fetchall()
 
-        # 15-min blokken wegschrijven
+        # Schrijf 15m blokken weg als simpele voorstellen
         cur.execute("DELETE FROM planning.voorstel_shifts WHERE datum=%s AND bron='auto'", (d,))
         total_blocks = 0
         for start_ts, aandeel_p50 in profiel:
